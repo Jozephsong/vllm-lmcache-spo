@@ -29,11 +29,16 @@ class _PendingSpec:
     Stored per-request and flushed to SSD only when the request is preempted.
     Updated (overwritten) every forward step so it always reflects the latest
     computed tokens.
+
+    Note: ``skip_leading_tokens`` is intentionally NOT stored here.  The
+    scheduler's ``from_request_tracker`` updates ``num_saved_tokens`` as if
+    write-through saves had occurred, so its value is wrong for SPO mode
+    (SPO never saves until preemption).  The actual number of tokens stored
+    by SPO is tracked separately in ``LMCacheSPOConnector._spo_stored``.
     """
 
     token_ids: list[int]
     slot_mapping: torch.Tensor  # CPU tensor; moved to device at flush time
-    skip_leading_tokens: int
     is_last_prefill: bool
 
 
@@ -116,6 +121,12 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
         # preemption or request completion.
         self._pending_store: dict[str, _PendingSpec] = {}
 
+        # req_id → number of tokens SPO has *actually* stored to SSD so far.
+        # This is separate from the scheduler's num_saved_tokens, which
+        # incorrectly assumes write-through semantics and would cause SPO to
+        # skip prefix chunks that were never actually stored.
+        self._spo_stored: dict[str, int] = {}
+
     # ──────────────────────────────────────────────────────────────
     # Worker-side overrides
     # ──────────────────────────────────────────────────────────────
@@ -144,9 +155,10 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
-        # Request finished normally — discard the snapshot without storing.
+        # Request finished normally — discard snapshots without storing.
         if self._is_spo:
             self._pending_store.pop(request.request_id, None)
+            self._spo_stored.pop(request.request_id, None)
         return super().request_finished(request, block_ids)
 
     # ──────────────────────────────────────────────────────────────
@@ -190,14 +202,12 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
             self._pending_store[req.req_id] = _PendingSpec(
                 token_ids=token_ids,
                 slot_mapping=req.slot_mapping,  # CPU tensor, fresh each step
-                skip_leading_tokens=save_spec.skip_leading_tokens,
                 is_last_prefill=req.is_last_prefill,
             )
             logger.debug(
-                "SPO capture: req=%s tokens=%d skip=%d",
+                "SPO capture: req=%s tokens=%d",
                 req.req_id,
                 len(token_ids),
-                save_spec.skip_leading_tokens,
             )
 
     def _flush_preempted(self, preempted_req_ids: set[str]) -> None:
@@ -235,8 +245,14 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
                 token_ids = token_ids[:aligned_len]
                 slot_mapping = slot_mapping[:aligned_len]
 
-            # Align the skip offset to chunk boundary.
-            skip = spec.skip_leading_tokens // chunk_size * chunk_size
+            # Determine skip based on what SPO has *actually* stored, NOT the
+            # scheduler's num_saved_tokens.  The scheduler assumes write-through
+            # semantics and advances its counter every step, so using
+            # save_spec.skip_leading_tokens would cause SPO to skip prefix
+            # chunks that were never actually written to SSD, producing a
+            # suffix-only store that LMCache's prefix-based lookup cannot find.
+            actually_stored = self._spo_stored.get(req_id, 0)
+            skip = actually_stored // chunk_size * chunk_size
 
             if skip >= len(token_ids):
                 logger.debug(
@@ -260,3 +276,4 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
                 slot_mapping=slot_mapping,
                 req_id=req_id,
             )
+            self._spo_stored[req_id] = len(token_ids)

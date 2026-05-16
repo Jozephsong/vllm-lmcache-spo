@@ -138,6 +138,7 @@ def _make_connector(mock_impl, *, is_spo: bool = True) -> LMCacheSPOConnector:
     connector = MagicMock(spec=LMCacheSPOConnector)
     connector._lmcache_engine = mock_impl
     connector._pending_store = {}
+    connector._spo_stored = {}
     connector._is_spo = is_spo
 
     for name in (
@@ -282,7 +283,6 @@ class TestCapturePending:
         spec = spo._pending_store["r1"]
         assert spec.token_ids == req.token_ids
         assert torch.equal(spec.slot_mapping, req.slot_mapping)
-        assert spec.skip_leading_tokens == 0
         assert spec.is_last_prefill is True
 
     def test_lookup_unpin_called_for_all_requests(self, spo, mock_impl):
@@ -318,11 +318,12 @@ class TestCapturePending:
         assert "r1" not in spo._pending_store
 
     def test_partial_skip_stored(self, spo, mock_impl):
-        # First CHUNK_SIZE already saved, but there are 2×CHUNK_SIZE total
+        # Scheduler says first CHUNK_SIZE already saved, 2×CHUNK_SIZE total tokens.
+        # _PendingSpec no longer stores skip; snapshot should be captured.
         req = _req("r1", 2 * CHUNK_SIZE, skip=CHUNK_SIZE)
         self._run(spo, _meta(req))
         assert "r1" in spo._pending_store
-        assert spo._pending_store["r1"].skip_leading_tokens == CHUNK_SIZE
+        assert len(spo._pending_store["r1"].token_ids) == 2 * CHUNK_SIZE
 
     def test_later_step_overwrites_earlier_entry(self, spo, mock_impl):
         # Step 1: 256 tokens
@@ -357,14 +358,23 @@ class TestCapturePending:
 
 
 class TestFlushPreempted:
-    def _plant(self, spo, req_id: str, num_tokens: int, *,
-               skip: int = 0, is_last_prefill: bool = True):
+    def _plant(
+        self,
+        spo,
+        req_id: str,
+        num_tokens: int,
+        *,
+        actually_stored: int = 0,
+        is_last_prefill: bool = True,
+    ):
+        """Populate _pending_store and optionally _spo_stored for a request."""
         spo._pending_store[req_id] = _PendingSpec(
             token_ids=list(range(num_tokens)),
             slot_mapping=_slot_mapping(num_tokens),
-            skip_leading_tokens=skip,
             is_last_prefill=is_last_prefill,
         )
+        if actually_stored > 0:
+            spo._spo_stored[req_id] = actually_stored
 
     def test_store_called_with_correct_args(self, spo, mock_impl):
         self._plant(spo, "r1", CHUNK_SIZE)
@@ -377,20 +387,25 @@ class TestFlushPreempted:
         assert kwargs["kvcaches"] == list(mock_impl.kv_caches.values())
         assert kwargs["req_id"] == "r1"
         assert len(kwargs["mask"]) == CHUNK_SIZE
-        assert kwargs["mask"].all()  # skip=0 → all True
+        assert kwargs["mask"].all()  # nothing stored yet → all True
 
     def test_entry_removed_after_flush(self, spo, mock_impl):
         self._plant(spo, "r1", CHUNK_SIZE)
         spo._flush_preempted({"r1"})
         assert "r1" not in spo._pending_store
 
+    def test_spo_stored_updated_after_flush(self, spo, mock_impl):
+        self._plant(spo, "r1", CHUNK_SIZE)
+        spo._flush_preempted({"r1"})
+        assert spo._spo_stored["r1"] == CHUNK_SIZE
+
     def test_no_pending_spec_no_store(self, spo, mock_impl):
         spo._flush_preempted({"r1"})  # nothing in _pending_store
         mock_impl.lmcache_engine.store.assert_not_called()
 
-    def test_skip_aligned_to_chunk_boundary(self, spo, mock_impl):
-        # skip=300 should be aligned down to 256 (one CHUNK_SIZE)
-        self._plant(spo, "r1", 2 * CHUNK_SIZE, skip=300)
+    def test_skip_from_spo_stored_aligned_to_chunk_boundary(self, spo, mock_impl):
+        # actually_stored=300 → aligned skip = 256 (one CHUNK_SIZE)
+        self._plant(spo, "r1", 2 * CHUNK_SIZE, actually_stored=300)
         spo._flush_preempted({"r1"})
 
         kwargs = mock_impl.lmcache_engine.store.call_args.kwargs
@@ -398,17 +413,31 @@ class TestFlushPreempted:
         assert not kwargs["mask"][:expected_skip].any()
         assert kwargs["mask"][expected_skip:].all()
 
-    def test_skip_zero_stores_all_tokens(self, spo, mock_impl):
-        self._plant(spo, "r1", CHUNK_SIZE, skip=0)
+    def test_no_spo_stored_stores_all_tokens(self, spo, mock_impl):
+        # No _spo_stored entry → skip = 0 → all tokens stored
+        self._plant(spo, "r1", CHUNK_SIZE)
         spo._flush_preempted({"r1"})
         kwargs = mock_impl.lmcache_engine.store.call_args.kwargs
         assert kwargs["mask"].all()
 
-    def test_skip_equals_aligned_token_count_no_store(self, spo, mock_impl):
-        # CHUNK_SIZE tokens with skip=CHUNK_SIZE → nothing left to store
-        self._plant(spo, "r1", CHUNK_SIZE, skip=CHUNK_SIZE)
+    def test_spo_stored_equals_token_count_no_store(self, spo, mock_impl):
+        # SPO already stored exactly CHUNK_SIZE tokens → nothing new to store
+        self._plant(spo, "r1", CHUNK_SIZE, actually_stored=CHUNK_SIZE)
         spo._flush_preempted({"r1"})
         mock_impl.lmcache_engine.store.assert_not_called()
+
+    def test_scheduler_skip_ignored_uses_spo_stored(self, spo, mock_impl):
+        """Scheduler's skip_leading_tokens is NOT used; _spo_stored is the source
+        of truth.  A fresh preemption should store all tokens (skip=0) even if
+        the scheduler thinks tokens were already saved via write-through."""
+        # Scheduler would have set skip_leading_tokens=CHUNK_SIZE, but that is
+        # NOT reflected in _PendingSpec anymore.  With _spo_stored absent,
+        # SPO stores everything from the beginning.
+        self._plant(spo, "r1", 2 * CHUNK_SIZE)  # no actually_stored
+        spo._flush_preempted({"r1"})
+
+        kwargs = mock_impl.lmcache_engine.store.call_args.kwargs
+        assert kwargs["mask"].all()  # skip=0, all tokens stored
 
     def test_decode_step_aligns_to_chunk_boundary(self, spo, mock_impl):
         # 300 tokens, not last prefill → aligned down to 256
@@ -475,6 +504,12 @@ class TestRequestFinished:
         spo.request_finished(self._make_request("r1"), [])
         assert "r1" not in spo._pending_store
 
+    def test_spo_removes_spo_stored_entry(self, spo, mock_impl):
+        spo._pending_store["r1"] = MagicMock()
+        spo._spo_stored["r1"] = CHUNK_SIZE
+        spo.request_finished(self._make_request("r1"), [])
+        assert "r1" not in spo._spo_stored
+
     def test_spo_no_entry_is_safe(self, spo, mock_impl):
         # Should not raise even if the request was never captured
         spo.request_finished(self._make_request("unknown"), [])
@@ -482,14 +517,19 @@ class TestRequestFinished:
     def test_spo_does_not_affect_other_entries(self, spo, mock_impl):
         spo._pending_store["r1"] = MagicMock()
         spo._pending_store["r2"] = MagicMock()
+        spo._spo_stored["r1"] = CHUNK_SIZE
+        spo._spo_stored["r2"] = CHUNK_SIZE
         spo.request_finished(self._make_request("r1"), [])
         assert "r2" in spo._pending_store
+        assert "r2" in spo._spo_stored
 
     def test_write_through_leaves_pending_store_unchanged(self, wt, mock_impl):
         wt._pending_store["r1"] = MagicMock()
+        wt._spo_stored["r1"] = CHUNK_SIZE
         wt.request_finished(self._make_request("r1"), [])
-        # write-through does not touch _pending_store
+        # write-through does not touch _pending_store or _spo_stored
         assert "r1" in wt._pending_store
+        assert "r1" in wt._spo_stored
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +560,7 @@ class TestEndToEnd:
 
         mock_impl.lmcache_engine.store.assert_not_called()
         assert spo._pending_store == {}
+        assert spo._spo_stored == {}
 
     def test_preemption_triggers_save(self, spo, mock_impl):
         """Preemption on step 2 must save the KV captured at step 1."""
@@ -583,3 +624,52 @@ class TestEndToEnd:
         # but decode steps are aligned to chunk boundary → CHUNK_SIZE tokens
         call_kwargs = mock_impl.lmcache_engine.store.call_args.kwargs
         assert len(call_kwargs["mask"]) == CHUNK_SIZE
+
+    def test_scheduler_skip_not_used_first_preemption_stores_all(self, spo, mock_impl):
+        """Regression test for the original SPO bug.
+
+        The scheduler's ``from_request_tracker`` updates ``num_saved_tokens``
+        as if write-through saves occurred, producing non-zero
+        ``save_spec.skip_leading_tokens`` in subsequent steps even though SPO
+        never actually stored anything.
+
+        The fix: SPO uses ``_spo_stored`` (tracks what was *actually* stored)
+        instead of the scheduler's skip.  On first preemption, ``_spo_stored``
+        is empty → skip=0 → all prefix tokens are stored, enabling cache hits.
+        """
+        # Step 1: scheduler sees skip=0, 256 tokens (prefill done)
+        self._capture(spo, _req("r1", CHUNK_SIZE, skip=0))
+        spo.handle_preemptions(set())
+
+        # Step 2: scheduler now thinks 256 tokens were saved (write-through
+        # assumption) so it reports skip=CHUNK_SIZE for the 2-chunk snapshot.
+        self._capture(spo, _req("r1", 2 * CHUNK_SIZE, skip=CHUNK_SIZE))
+        spo.handle_preemptions(set())
+
+        # First-ever preemption: SPO must store ALL 512 tokens, not just
+        # the second chunk.  Without the fix, skip would equal CHUNK_SIZE
+        # and tokens 0..255 would never be stored → prefix lookup miss.
+        spo.handle_preemptions({"r1"})
+
+        call_kwargs = mock_impl.lmcache_engine.store.call_args.kwargs
+        assert call_kwargs["mask"].all()           # skip=0, everything stored
+        assert len(call_kwargs["mask"]) == 2 * CHUNK_SIZE
+
+    def test_incremental_store_across_multiple_preemptions(self, spo, mock_impl):
+        """Second preemption (after re-submission) correctly skips already-stored
+        tokens tracked in ``_spo_stored``."""
+        # First preemption: store tokens 0..255
+        self._capture(spo, _req("r1", CHUNK_SIZE, skip=0))
+        spo.handle_preemptions({"r1"})
+        assert spo._spo_stored["r1"] == CHUNK_SIZE
+
+        # Re-submission: request grows to 512 tokens; SPO must store only 256..511
+        self._capture(spo, _req("r1", 2 * CHUNK_SIZE, skip=CHUNK_SIZE))
+        spo.handle_preemptions(set())
+        spo.handle_preemptions({"r1"})
+
+        assert mock_impl.lmcache_engine.store.call_count == 2
+        second_call = mock_impl.lmcache_engine.store.call_args_list[1].kwargs
+        # Second store skips the first CHUNK_SIZE tokens
+        assert not second_call["mask"][:CHUNK_SIZE].any()
+        assert second_call["mask"][CHUNK_SIZE:].all()
