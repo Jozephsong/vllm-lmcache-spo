@@ -228,8 +228,19 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
         kvcaches = list(impl.kv_caches.values())
         chunk_size = impl._lmcache_chunk_size
 
+        # Pre-check whether the engine will actually write data.  engine.store()
+        # silently returns early when unhealthy, frozen, or passive — without
+        # raising an exception and without storing anything.  We need this flag
+        # so we don't advance _spo_stored for a store that never happened.
+        _passive_check = getattr(engine, "_is_passive", lambda: False)
+        store_will_proceed = (
+            engine.is_healthy() and not engine.is_frozen() and not _passive_check()
+        )
+
         for req_id in preempted_req_ids:
-            spec = self._pending_store.pop(req_id, None)
+            # Use get() here — pop() happens in the finally block so the
+            # snapshot is always cleaned up even when store() raises.
+            spec = self._pending_store.get(req_id)
             if spec is None:
                 continue
 
@@ -255,6 +266,7 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
             skip = actually_stored // chunk_size * chunk_size
 
             if skip >= len(token_ids):
+                self._pending_store.pop(req_id, None)
                 logger.debug(
                     "SPO flush: req=%s already fully saved, skipping", req_id
                 )
@@ -269,11 +281,29 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
                 len(token_ids) - skip,
                 skip,
             )
-            engine.store(
-                token_ids,
-                mask=store_mask,
-                kvcaches=kvcaches,
-                slot_mapping=slot_mapping,
-                req_id=req_id,
-            )
-            self._spo_stored[req_id] = len(token_ids)
+            try:
+                engine.store(
+                    token_ids,
+                    mask=store_mask,
+                    kvcaches=kvcaches,
+                    slot_mapping=slot_mapping,
+                    req_id=req_id,
+                )
+                if store_will_proceed:
+                    self._spo_stored[req_id] = len(token_ids)
+                else:
+                    logger.warning(
+                        "SPO flush: engine skipped store for req=%s "
+                        "(unhealthy/frozen/passive); _spo_stored not advanced",
+                        req_id,
+                    )
+            except Exception:
+                logger.warning(
+                    "SPO flush: store raised for req=%s; _spo_stored not advanced",
+                    req_id,
+                    exc_info=True,
+                )
+            finally:
+                # Blocks are freed by _update_states immediately after this
+                # method returns, so the snapshot is always stale from here on.
+                self._pending_store.pop(req_id, None)

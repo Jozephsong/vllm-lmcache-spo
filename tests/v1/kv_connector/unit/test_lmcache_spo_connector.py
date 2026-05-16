@@ -121,6 +121,9 @@ def mock_impl():
     """Minimal fake of LMCacheConnectorV1Impl."""
     impl = MagicMock()
     impl.lmcache_engine = MagicMock()
+    impl.lmcache_engine.is_healthy.return_value = True
+    impl.lmcache_engine.is_frozen.return_value = False
+    impl.lmcache_engine._is_passive.return_value = False
     impl.kv_caches = {
         "layer0": torch.zeros(200, 2, 4),
         "layer1": torch.zeros(200, 2, 4),
@@ -486,6 +489,43 @@ class TestFlushPreempted:
 
         kwargs = mock_impl.lmcache_engine.store.call_args.kwargs
         assert kwargs["slot_mapping"].device.type == "cpu"
+
+    def test_snapshot_removed_on_store_exception(self, spo, mock_impl):
+        """Snapshot must be popped (finally block) even if engine.store() raises."""
+        mock_impl.lmcache_engine.store.side_effect = RuntimeError("disk full")
+        self._plant(spo, "r1", CHUNK_SIZE)
+        spo._flush_preempted({"r1"})
+        assert "r1" not in spo._pending_store
+
+    def test_spo_stored_not_updated_on_store_exception(self, spo, mock_impl):
+        """_spo_stored must NOT advance when store() raises an exception."""
+        mock_impl.lmcache_engine.store.side_effect = RuntimeError("disk full")
+        self._plant(spo, "r1", CHUNK_SIZE)
+        spo._flush_preempted({"r1"})
+        assert "r1" not in spo._spo_stored
+
+    def test_spo_stored_not_updated_when_engine_unhealthy(self, spo, mock_impl):
+        """_spo_stored must NOT advance when engine silently skips the store."""
+        mock_impl.lmcache_engine.is_healthy.return_value = False
+        self._plant(spo, "r1", CHUNK_SIZE)
+        spo._flush_preempted({"r1"})
+        mock_impl.lmcache_engine.store.assert_called_once()  # store still called
+        assert "r1" not in spo._spo_stored
+
+    def test_spo_stored_not_updated_when_engine_frozen(self, spo, mock_impl):
+        """_spo_stored must NOT advance when engine is in frozen mode."""
+        mock_impl.lmcache_engine.is_frozen.return_value = True
+        self._plant(spo, "r1", CHUNK_SIZE)
+        spo._flush_preempted({"r1"})
+        mock_impl.lmcache_engine.store.assert_called_once()  # store still called
+        assert "r1" not in spo._spo_stored
+
+    def test_snapshot_removed_even_when_store_silently_skipped(self, spo, mock_impl):
+        """Snapshot must be popped even when engine silently skips the store."""
+        mock_impl.lmcache_engine.is_healthy.return_value = False
+        self._plant(spo, "r1", CHUNK_SIZE)
+        spo._flush_preempted({"r1"})
+        assert "r1" not in spo._pending_store
 
 
 # ---------------------------------------------------------------------------
