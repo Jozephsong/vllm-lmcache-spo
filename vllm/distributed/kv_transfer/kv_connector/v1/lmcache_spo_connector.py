@@ -119,18 +119,18 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
         """Flush KV to SSD for blocks about to be overwritten.
 
         Called BEFORE the forward pass so HBM data is still valid.
-        After flushing, cleans up finished requests that had no evictions to
-        prevent ``_pending_store`` from growing without bound.
+
+        ``_pending_store`` entries are removed only inside ``_flush_evicted``
+        after the KV has been stored.  We do NOT eagerly clean up
+        ``finished_req_ids`` here because a request can finish in the same
+        scheduling step that evicts *other* requests' blocks; removing the
+        entry at that point would prevent us from storing KV when the
+        finished request's own blocks are evicted in a later step.
         """
         if not self._is_spo:
             return
         if evicted_block_ids:
             self._flush_evicted(evicted_block_ids)
-        # Clean up finished requests whose blocks were not evicted this step.
-        # _flush_evicted already called _cleanup_req for requests that were
-        # flushed, so this pop is a no-op for those.
-        for req_id in finished_req_ids:
-            self._cleanup_req(req_id)
 
     def wait_for_save(self) -> None:
         """SPO: snapshot running requests without writing to SSD.
@@ -146,8 +146,8 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
-        # Keep _pending_store entry alive until blocks are evicted or until
-        # handle_block_evictions cleans it up via finished_req_ids.
+        # Keep _pending_store entry alive until the request's blocks are
+        # evicted and stored by _flush_evicted.
         return super().request_finished(request, block_ids)
 
     # ──────────────────────────────────────────────────────────────
