@@ -180,14 +180,26 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
             if save_spec.skip_leading_tokens >= len(token_ids):
                 continue
 
+            # Preserve the minimum skip seen across steps so that multi-chunk
+            # prefill is stored in full at eviction time.
+            # tracker.num_saved_tokens advances optimistically each step
+            # (assuming write-through), which would cause save_spec.skip to
+            # grow and lose earlier chunks. Taking the min keeps the initial
+            # lookup-hit-based skip (tokens already in LMCache) while ignoring
+            # the optimistic advancement.
+            existing = self._pending_store.get(req.req_id)
+            skip = save_spec.skip_leading_tokens
+            if existing is not None:
+                skip = min(existing.skip_leading_tokens, skip)
+
             self._pending_store[req.req_id] = _PendingSpec(
                 token_ids=token_ids,
                 slot_mapping=req.slot_mapping,
                 is_last_prefill=req.is_last_prefill,
-                skip_leading_tokens=save_spec.skip_leading_tokens,
+                skip_leading_tokens=skip,
                 request_configs=getattr(req, "request_configs", None),
             )
-            logger.debug("SPO capture: req=%s tokens=%d", req.req_id, len(token_ids))
+            logger.debug("SPO capture: req=%s tokens=%d skip=%d", req.req_id, len(token_ids), skip)
 
     def _flush_evicted(self, evicted_block_ids: set[int]) -> None:
         """Store KV for any request whose blocks overlap with evicted_block_ids.
