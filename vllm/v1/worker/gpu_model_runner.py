@@ -3574,6 +3574,12 @@ class GPUModelRunner(
                 scheduler_output.preempted_req_ids
             )
 
+        if scheduler_output.evicted_block_ids and has_kv_transfer_group():
+            get_kv_transfer_group().handle_block_evictions(
+                scheduler_output.evicted_block_ids,
+                scheduler_output.finished_req_ids,
+            )
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),

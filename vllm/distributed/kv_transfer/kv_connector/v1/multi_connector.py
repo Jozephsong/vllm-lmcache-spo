@@ -320,6 +320,13 @@ class MultiConnector(KVConnectorBase_V1):
         for c in self._connectors:
             c.handle_preemptions(preempted_req_ids)
 
+    def handle_block_evictions(
+        self, evicted_block_ids: set[int], finished_req_ids: set[str]
+    ) -> None:
+        """Handle block evictions for all sub-connectors."""
+        for c in self._connectors:
+            c.handle_block_evictions(evicted_block_ids, finished_req_ids)
+
     def get_finished_count(self) -> int | None:
         # TODO(https://github.com/vllm-project/vllm/issues/33400)
         # Currently no connectors return non-None

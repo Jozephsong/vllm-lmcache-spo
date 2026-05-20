@@ -238,6 +238,10 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # Block IDs evicted from the prefix cache during this scheduling step.
+    # Used by spill-over KV connectors to flush GPU KV data before overwrite.
+    evicted_block_ids: set[int] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

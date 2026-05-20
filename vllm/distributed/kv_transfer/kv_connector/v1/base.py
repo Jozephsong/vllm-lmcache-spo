@@ -295,6 +295,16 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def handle_block_evictions(
+        self, evicted_block_ids: set[int], finished_req_ids: set[str]
+    ) -> None:
+        """
+        Handle prefix-cache block evictions BEFORE the forward pass overwrites
+        the evicted blocks. Used by spill-over connectors to flush GPU KV data
+        to external storage (e.g., SSD) before it is lost.
+        """
+        return
+
     @abstractmethod
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """

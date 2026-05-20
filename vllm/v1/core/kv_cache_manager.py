@@ -476,6 +476,10 @@ class KVCacheManager:
         """
         return self.block_pool.take_events()
 
+    def take_evicted_block_ids(self) -> list[int]:
+        """Return block IDs evicted from the prefix cache since the last call."""
+        return self.block_pool.take_evicted_block_ids()
+
     def get_blocks(self, request_id: str) -> KVCacheBlocks:
         """Get the blocks of a request."""
         return self.create_kv_cache_blocks(self.coordinator.get_blocks(request_id))

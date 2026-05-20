@@ -180,6 +180,8 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
+        self._evicted_block_ids: list[int] = []
+
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -374,6 +376,7 @@ class BlockPool:
             # eviction is not needed
             return False
 
+        self._evicted_block_ids.append(block.block_id)
         block.reset_hash()
 
         if self.enable_kv_cache_events:
@@ -475,6 +478,12 @@ class BlockPool:
             self.kv_event_queue.append(AllBlocksCleared())
 
         return True
+
+    def take_evicted_block_ids(self) -> list[int]:
+        """Return block IDs evicted from the prefix cache since the last call."""
+        evicted = self._evicted_block_ids
+        self._evicted_block_ids = []
+        return evicted
 
     def get_num_free_blocks(self) -> int:
         """Get the number of free blocks in the pool.
