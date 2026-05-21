@@ -52,16 +52,16 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
     The spill-over path:
 
     * ``wait_for_save`` — snapshots each running request into ``_pending_store``.
-      Snapshots persist until the request's blocks are evicted or the request
-      finishes and is explicitly cleaned up via ``finished_req_ids``.
+      Snapshots persist until the request's blocks are evicted.  Finished
+      requests are NOT eagerly removed; their entries survive until
+      ``_flush_evicted`` handles the actual block eviction.
 
     * ``handle_block_evictions`` (called BEFORE the forward pass that would
       overwrite evicted blocks) —
-      1. Scans ``_pending_store`` for any request whose blocks overlap with
-         the evicted set and calls ``lmcache_engine.store()`` while HBM data
-         is still valid.
-      2. Cleans up ``finished_req_ids`` entries that had no evictions, preventing
-         unbounded growth of ``_pending_store``.
+      Scans ``_pending_store`` for any request whose blocks overlap with
+      the evicted set and calls ``lmcache_engine.store()`` while HBM data
+      is still valid.  Cleanup happens inside ``_flush_evicted`` only after
+      a successful store, not eagerly on ``finished_req_ids``.
 
     Configuration example::
 
@@ -108,6 +108,10 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
         # blocks are evicted or explicitly cleaned up via finished_req_ids.
         # Overwritten each step via _capture_pending for running requests.
         self._pending_store: dict[str, _PendingSpec] = {}
+        # Hash of the first stored chunk per successful flush; prevents storing
+        # the same prefix content twice (e.g., concurrent requests sharing a
+        # system prompt that are each evicted independently).
+        self._stored_chunk_sigs: set[int] = set()
 
     # ──────────────────────────────────────────────────────────────
     # Worker-side overrides
@@ -263,6 +267,21 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
                 token_ids = token_ids[:aligned_len]
                 slot_mapping = slot_mapping[:aligned_len]
 
+            if skip >= len(token_ids):
+                self._cleanup_req(req_id)
+                continue
+
+            # Content-level dedup: skip if the first stored chunk was already
+            # flushed this session (handles concurrent requests sharing the
+            # same prefix and cross-step re-eviction of the same content).
+            chunk_sig = hash(tuple(token_ids[skip:skip + chunk_size]))
+            if chunk_sig in self._stored_chunk_sigs:
+                logger.debug(
+                    "SPO dedup: req=%s first-chunk already stored — skip", req_id
+                )
+                self._cleanup_req(req_id)
+                continue
+
             store_mask = torch.ones(len(token_ids), dtype=torch.bool)
             store_mask[:skip] = False
 
@@ -282,6 +301,7 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
                     request_configs=spec.request_configs,
                     req_id=req_id,
                 )
+                self._stored_chunk_sigs.add(chunk_sig)
             except Exception:
                 logger.warning(
                     "SPO eviction: store raised for req=%s", req_id, exc_info=True
