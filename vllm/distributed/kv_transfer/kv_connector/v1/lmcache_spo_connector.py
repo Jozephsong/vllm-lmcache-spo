@@ -35,6 +35,7 @@ class _PendingSpec:
     is_last_prefill: bool
     skip_leading_tokens: int         # from save_spec; avoids re-storing LMCache-hit prefix
     request_configs: Optional[dict]  # for tag-based key generation (lmcache.tag.*)
+    block_ids: frozenset[int]        # pre-computed for inverted-index lookup
 
 
 class LMCacheSPOConnector(LMCacheConnectorV1):
@@ -108,6 +109,9 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
         # blocks are evicted or explicitly cleaned up via finished_req_ids.
         # Overwritten each step via _capture_pending for running requests.
         self._pending_store: dict[str, _PendingSpec] = {}
+        # Inverted index: block_id → set of req_ids whose slot_mapping covers
+        # that block. Allows O(|evicted|) triggered-req lookup in _flush_evicted.
+        self._block_to_reqs: dict[int, set[str]] = {}
         # Hash of the first stored chunk per successful flush; prevents storing
         # the same prefix content twice (e.g., concurrent requests sharing a
         # system prompt that are each evicted independently).
@@ -173,6 +177,8 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
         if not isinstance(meta, LMCacheConnectorMetadata):
             return
 
+        block_size = self._vllm_config.cache_config.block_size
+
         for req in meta.requests:
             engine.lookup_unpin(req.req_id)
 
@@ -195,14 +201,26 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
             skip = save_spec.skip_leading_tokens
             if existing is not None:
                 skip = min(existing.skip_leading_tokens, skip)
+                for block_id in existing.block_ids:
+                    s = self._block_to_reqs.get(block_id)
+                    if s is not None:
+                        s.discard(req.req_id)
+                        if not s:
+                            del self._block_to_reqs[block_id]
 
+            block_ids = frozenset(
+                int(b) for b in torch.unique(req.slot_mapping // block_size).tolist()
+            )
             self._pending_store[req.req_id] = _PendingSpec(
                 token_ids=token_ids,
                 slot_mapping=req.slot_mapping,
                 is_last_prefill=req.is_last_prefill,
                 skip_leading_tokens=skip,
                 request_configs=getattr(req, "request_configs", None),
+                block_ids=block_ids,
             )
+            for block_id in block_ids:
+                self._block_to_reqs.setdefault(block_id, set()).add(req.req_id)
             logger.debug("SPO capture: req=%s tokens=%d skip=%d", req.req_id, len(token_ids), skip)
 
     def _flush_evicted(self, evicted_block_ids: set[int]) -> None:
@@ -232,16 +250,12 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
 
         kvcaches = list(impl.kv_caches.values())
         chunk_size = impl._lmcache_chunk_size
-        block_size = self._vllm_config.cache_config.block_size
 
         triggered: dict[str, _PendingSpec] = {}
-        for req_id, spec in list(self._pending_store.items()):
-            spec_blocks = {
-                int(b)
-                for b in torch.unique(spec.slot_mapping // block_size).tolist()
-            }
-            if spec_blocks & evicted_block_ids:
-                triggered[req_id] = spec
+        for block_id in evicted_block_ids:
+            for req_id in self._block_to_reqs.get(block_id, ()):
+                if req_id in self._pending_store:
+                    triggered[req_id] = self._pending_store[req_id]
 
         for req_id, spec in triggered.items():
             token_ids = spec.token_ids
@@ -311,4 +325,11 @@ class LMCacheSPOConnector(LMCacheConnectorV1):
 
     def _cleanup_req(self, req_id: str) -> None:
         """Remove tracking state for a request."""
-        self._pending_store.pop(req_id, None)
+        spec = self._pending_store.pop(req_id, None)
+        if spec is not None:
+            for block_id in spec.block_ids:
+                s = self._block_to_reqs.get(block_id)
+                if s is not None:
+                    s.discard(req_id)
+                    if not s:
+                        del self._block_to_reqs[block_id]
