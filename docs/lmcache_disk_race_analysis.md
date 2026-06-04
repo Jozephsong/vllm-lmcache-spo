@@ -147,3 +147,73 @@ lookup과 submit_put_task 사이에 write가 완료된 경우를 이 check가 �
 |------|-----------|-----------|
 | `contains()`에 `put_tasks` 체크 추가 | lookup 시점 | write 진행 중인 경우 + 불필요한 KV copy 방지 |
 | `submit_put_task()`에 `contains()` 추가 | write 직전 | lookup 이후 write가 완료된 경우 |
+
+---
+
+## 추가 수정: 남아있는 두 문제
+
+### 문제 1: `batched_async_contains()` — async lookup 경로에도 같은 문제
+
+`contains()`는 수정됐지만 async lookup 경로(`async_lookup_and_prefetch`)에서 사용되는
+`batched_async_contains()`는 여전히 `self.dict`만 확인했다.
+
+```python
+# 변경 전
+async def batched_async_contains(self, ...):
+    with self.disk_lock:
+        for key in keys:
+            if key not in self.dict:   # put_tasks 미확인
+                return num_hit_counts
+            ...
+
+# 변경 후
+async def batched_async_contains(self, ...):
+    with self.disk_lock:
+        for key in keys:
+            if self.disk_worker.exists_in_put_tasks(key):  # ← 추가
+                num_hit_counts += 1
+                continue
+            if key not in self.dict:
+                return num_hit_counts
+            ...
+```
+
+in-flight write를 hit로 처리하여 불필요한 GPU→CPU KV copy와 `submit_put_task` 호출을 차단한다.
+
+---
+
+### 문제 2: `interval_stored_tokens` 과다 계산
+
+`cache_engine.store()` (observability.py) 에서 `on_store_request`가 dedup 체크보다
+**앞서** `interval_stored_tokens`를 증가시켜 실제보다 많은 토큰이 저장된 것으로 집계됐다.
+
+```python
+# 변경 전: on_store_request에서 즉시 카운트 (dedup 이전)
+def on_store_request(self, num_tokens):
+    self.interval_stored_tokens += num_tokens   # dedup 전에 카운트
+    ...
+
+# 변경 후: on_store_finished에서 실제 처리된 토큰 수로 카운트
+def on_store_request(self, num_tokens):
+    # interval_stored_tokens 증가 제거
+    ...
+
+def on_store_finished(self, store_stats, num_stored_tokens=-1):
+    if num_stored_tokens >= 0:
+        store_stats.num_tokens = num_stored_tokens
+    self.interval_stored_tokens += store_stats.num_tokens  # ← 추가
+```
+
+이로써:
+- memory 할당 실패로 `on_store_finished`가 호출되지 않는 경우 → 카운트 안 됨 (정확)
+- freeze mode early return → 카운트 안 됨 (정확)
+- `contains()` 수정으로 lookup 단계에서 skip된 chunk → `process_tokens`에서 제외 → `tot_token_num`에 포함 안 됨 → 카운트 안 됨 (정확)
+
+### 전체 수정 요약
+
+| 수정 | 파일 | 효과 |
+|------|------|------|
+| `contains()`에 `put_tasks` 체크 추가 | `local_disk_backend.py` | sync lookup: in-flight write hit 처리 |
+| `submit_put_task()`에 `contains()` 추가 | `local_disk_backend.py` | 완료된 write 재시도 차단 |
+| `batched_async_contains()`에 `put_tasks` 체크 추가 | `local_disk_backend.py` | async lookup: in-flight write hit 처리 |
+| `interval_stored_tokens` 카운트 시점 이동 | `observability.py` | stored token metric 정확도 개선 |
