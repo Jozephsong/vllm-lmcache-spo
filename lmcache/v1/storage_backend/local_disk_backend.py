@@ -482,6 +482,9 @@ class LocalDiskBackend(StorageBackendInterface):
         num_hit_counts = 0
         with self.disk_lock:
             for key in keys:
+                if self.disk_worker.exists_in_put_tasks(key):
+                    num_hit_counts += 1
+                    continue
                 if key not in self.dict:
                     return num_hit_counts
                 if pin:

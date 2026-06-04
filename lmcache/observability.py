@@ -468,7 +468,6 @@ class LMCStatsMonitor:
             end_time=0,
         )
         self.interval_store_requests += 1
-        self.interval_stored_tokens += num_tokens
         self.store_requests[self.store_request_id] = store_stats
         self.store_request_id += 1
         return store_stats
@@ -485,6 +484,7 @@ class LMCStatsMonitor:
             store_stats.end_time = curr_time
         if num_stored_tokens >= 0:
             store_stats.num_tokens = num_stored_tokens
+        self.interval_stored_tokens += store_stats.num_tokens
 
     @thread_safe
     def on_p2p_transfer_request(self, num_tokens: int) -> int:
