@@ -178,6 +178,8 @@ class LocalDiskBackend(StorageBackendInterface):
         return os.path.join(self.path, key.to_string().replace("/", "-") + ".pt")
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
+        if self.disk_worker.exists_in_put_tasks(key):
+            return True
         with self.disk_lock:
             if key not in self.dict:
                 return False
@@ -305,9 +307,12 @@ class LocalDiskBackend(StorageBackendInterface):
         """
         assert memory_obj.tensor is not None
 
-        # skip repeated save
+        # skip repeated save: in-flight write or already written to disk
         if self.exists_in_put_tasks(key):
             logger.debug(f"Put task for {key} is already in progress.")
+            return None
+        if self.contains(key):
+            logger.debug(f"Key {key} already exists on disk, skipping.")
             return None
 
         self.disk_worker.insert_put_task(key)
