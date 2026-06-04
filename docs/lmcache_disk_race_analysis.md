@@ -217,3 +217,55 @@ def on_store_finished(self, store_stats, num_stored_tokens=-1):
 | `submit_put_task()`에 `contains()` 추가 | `local_disk_backend.py` | 완료된 write 재시도 차단 |
 | `batched_async_contains()`에 `put_tasks` 체크 추가 | `local_disk_backend.py` | async lookup: in-flight write hit 처리 |
 | `interval_stored_tokens` 카운트 시점 이동 | `observability.py` | stored token metric 정확도 개선 |
+
+---
+
+## 추가 수정: eviction 실패 시 `put_tasks` key 영구 잔류 버그
+
+### 문제
+
+`submit_put_task`는 write를 시작하기 전 항상 `insert_put_task(key)`를 호출한다.
+그런데 SSD 용량 부족으로 eviction 후보가 없으면 `evict_success = False`로 조기 반환하면서
+`remove_put_task(key)`를 호출하지 않아 key가 `put_tasks`에 영구적으로 잔류한다.
+
+```python
+self.disk_worker.insert_put_task(key)   # key 등록
+
+with self.disk_lock:
+    while self.current_cache_size + required_size > self.max_cache_size:
+        evict_keys = self.cache_policy.get_evict_candidates(...)
+        if not evict_keys:
+            evict_success = False   # 지울 후보 없음
+            break
+
+if not evict_success:
+    return None   # ← remove_put_task 미호출 → key 영구 잔류
+```
+
+`contains()`가 `self.dict`만 확인하던 기존에는 stuck key의 영향이 "해당 key를 다시
+write할 수 없음" 정도였다. 그러나 `contains()`에 `put_tasks` 체크를 추가한 이후로는
+stuck key에 대해 `contains()` = True → lookup hit → `skip_leading_tokens` 설정 →
+해당 chunk가 영구적으로 저장되지 않는 **데이터 유실**로 이어진다.
+
+### 수정
+
+```python
+# 변경 전
+if not evict_success:
+    return None
+
+# 변경 후
+if not evict_success:
+    self.disk_worker.remove_put_task(key)   # ← 추가
+    return None
+```
+
+### 최종 전체 수정 요약
+
+| 수정 | 파일 | 효과 |
+|------|------|------|
+| `contains()`에 `put_tasks` 체크 추가 | `local_disk_backend.py` | sync lookup: in-flight write hit 처리 |
+| `submit_put_task()`에 `contains()` 추가 | `local_disk_backend.py` | 완료된 write 재시도 차단 |
+| `batched_async_contains()`에 `put_tasks` 체크 추가 | `local_disk_backend.py` | async lookup: in-flight write hit 처리 |
+| `interval_stored_tokens` 카운트 시점 이동 | `observability.py` | stored token metric 정확도 개선 |
+| eviction 실패 시 `remove_put_task` 추가 | `local_disk_backend.py` | stuck key → 데이터 유실 방지 |
