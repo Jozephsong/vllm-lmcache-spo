@@ -269,3 +269,39 @@ if not evict_success:
 | `batched_async_contains()`에 `put_tasks` 체크 추가 | `local_disk_backend.py` | async lookup: in-flight write hit 처리 |
 | `interval_stored_tokens` 카운트 시점 이동 | `observability.py` | stored token metric 정확도 개선 |
 | eviction 실패 시 `remove_put_task` 추가 | `local_disk_backend.py` | stuck key → 데이터 유실 방지 |
+
+---
+
+## 잔여 한계 및 최종 결론
+
+### local_cpu_backend 영향 없음
+
+`LocalCPUBackend.submit_put_task`는 check와 insert가 `cpu_lock` 안에서 원자적으로
+수행되는 동기 방식이므로, disk backend에서 수정한 모든 문제가 해당되지 않는다.
+`exists_in_put_tasks`가 항상 False를 반환하는 것도 in-flight write 개념이 없어서
+의도된 설계다.
+
+### 잔여 오차
+
+수정 이후에도 두 가지 구조적 한계가 남아있다.
+
+**local disk usage (`self.usage`) increment/decrement 단위 불일치**:
+- increment: `len(buffer)` (직렬화된 파일 크기)
+- decrement: `meta.size` = `get_physical_size()` (메모리 텐서 크기)
+- 두 값이 다를 경우 eviction 시마다 `usage`가 조금씩 틀려진다.
+- pre-existing 문제로 이번 수정 범위 밖이다.
+
+**store token metric 잔여 overcounting**:
+- GPU→CPU copy 이후 `submit_put_task`에서 write가 skip되는 경우
+  (residual race, eviction 실패) `tot_token_num`에는 포함되지만 실제로 SSD에
+  쓰이지 않은 토큰이 `interval_stored_tokens`에 카운트된다.
+- SSD 용량이 충분하면 eviction 실패 케이스는 발생하지 않고,
+  `contains()` 수정으로 residual race도 극히 드물어져 실용적으로 무시 가능한 수준이다.
+
+### 고QPS에서 메트릭이 기대보다 높게 나온 것은 버그였나
+
+맞다.
+- `local disk usage`: race condition으로 실제 중복 write가 발생한 것 → 버그
+- `store token`: dedup 이전에 카운트해서 실제 저장량보다 부풀려진 것 → 버그
+
+SSD 용량이 충분한 환경에서는 이번 수정 이후 두 메트릭 모두 실용적으로 정확하다.
