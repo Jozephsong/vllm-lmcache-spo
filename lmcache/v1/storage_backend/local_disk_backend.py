@@ -343,6 +343,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.current_cache_size += required_size
 
         if not evict_success:
+            self.disk_worker.remove_put_task(key)
             return None
 
         self.cache_policy.update_on_put(key)
