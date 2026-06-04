@@ -95,37 +95,55 @@ QPS가 극단적으로 높으면 write 요청이 폭주하여 queue가 쌓이고
 
 ---
 
-## 수정 방향
+## 수정 내용
 
-`submit_put_task`에서 `self.dict`도 함께 확인한다:
+두 곳을 수정하여 중복 write를 차단한다.
 
-```python
-# 현재
-if self.exists_in_put_tasks(key):
-    return None
-
-# 수정안: 완료된 write도 차단
-if self.exists_in_put_tasks(key) or self.contains(key):
-    return None
-```
-
-두 check가 별도 lock 획득이므로 완전한 원자성은 아니지만,
-실용적으로 대부분의 중복 write를 방지할 수 있다.
-완전히 막으려면 check와 insert를 단일 `put_lock` 구간으로 합쳐야 한다:
+### 1. `contains()` — in-flight write도 hit로 처리
 
 ```python
-def check_and_insert_put_task(self, key) -> bool:
-    """Returns False if already stored or in-flight (skip); True if newly inserted."""
-    with self.put_lock:
-        if key in self.put_tasks:
-            return False
+# 변경 전
+def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
     with self.disk_lock:
-        if key in self.dict:
+        if key not in self.dict:
             return False
-    with self.put_lock:
-        # double-check after acquiring lock
-        if key in self.put_tasks:
-            return False
-        self.put_tasks.append(key)
+        ...
+
+# 변경 후
+def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
+    if self.disk_worker.exists_in_put_tasks(key):  # ← 추가
         return True
+    with self.disk_lock:
+        if key not in self.dict:
+            return False
+        ...
 ```
+
+lookup 시점에 in-flight write도 hit로 반환하므로 `skip_leading_tokens`가 정확히 설정되어
+`engine.store()` 단계에서 해당 chunk가 마스킹된다. `submit_put_task`까지 도달하지 않는다.
+
+### 2. `submit_put_task()` — 완료된 write도 차단
+
+```python
+# 변경 전
+if self.exists_in_put_tasks(key):
+    logger.debug(f"Put task for {key} is already in progress.")
+    return None
+
+# 변경 후
+if self.exists_in_put_tasks(key):
+    logger.debug(f"Put task for {key} is already in progress.")
+    return None
+if self.contains(key):                              # ← 추가
+    logger.debug(f"Key {key} already exists on disk, skipping.")
+    return None
+```
+
+lookup과 submit_put_task 사이에 write가 완료된 경우를 이 check가 잡는다.
+
+### 두 수정의 역할
+
+| 수정 | 방어 시점 | 방어 대상 |
+|------|-----------|-----------|
+| `contains()`에 `put_tasks` 체크 추가 | lookup 시점 | write 진행 중인 경우 + 불필요한 KV copy 방지 |
+| `submit_put_task()`에 `contains()` 추가 | write 직전 | lookup 이후 write가 완료된 경우 |
