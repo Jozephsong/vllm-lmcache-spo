@@ -465,6 +465,10 @@ class LMCacheEngine:
                 request_configs=request_configs,
             ):
                 assert isinstance(key, CacheEngineKey)
+                # Skip if already stored — prevents GPU copy + tot_token_num
+                # overcounting when concurrent requests race at high QPS.
+                if self.storage_manager.contains(key, self.store_location):
+                    continue
                 # Allocate the memory object
                 num_tokens = end - start
                 kv_shapes = self.metadata.get_shapes(num_tokens)
